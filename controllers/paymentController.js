@@ -29,7 +29,7 @@ exports.createCheckoutSession = async (req, res, next) => {
       line_items: [
         {
           price_data: {
-            currency: 'usd', // Stripe Checkout doesn't support BDT directly; amounts converted from BDT cents-equivalent
+            currency: 'usd',
             product_data: {
               name: property.title,
               description: `Booking for ${property.location} — move-in ${new Date(booking.moveInDate).toLocaleDateString()}`,
@@ -56,10 +56,63 @@ exports.createCheckoutSession = async (req, res, next) => {
   }
 };
 
+// @desc    Tenant: verify payment after Stripe redirect (fallback for when webhook is delayed)
+// @route   GET /api/payments/verify?session_id=xxx&bookingId=xxx
+exports.verifyPayment = async (req, res, next) => {
+  try {
+    const { session_id, bookingId } = req.query;
+    if (!session_id || !bookingId) {
+      return res.status(400).json({ message: 'session_id and bookingId are required' });
+    }
+
+    const booking = await Booking.findById(bookingId);
+    if (!booking) return res.status(404).json({ message: 'Booking not found' });
+    if (booking.tenant.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Not authorized' });
+    }
+
+    // If webhook already handled it, just return success
+    if (booking.paymentStatus === 'Completed') {
+      return res.json({ success: true, booking });
+    }
+
+    // Retrieve session from Stripe to verify payment
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+
+    if (session.payment_status === 'paid') {
+      const { propertyId, tenantId, ownerId } = session.metadata || {};
+
+      booking.paymentStatus = 'Completed';
+      booking.status = 'Approved';
+      booking.amountPaid = (session.amount_total || 0) / 100;
+      booking.transactionId = session.payment_intent || session.id;
+      await booking.save();
+
+      // Create transaction only if not already exists for this session
+      const existingTx = await Transaction.findOne({ stripeSessionId: session.id });
+      if (!existingTx) {
+        await Transaction.create({
+          booking: booking._id,
+          tenant: tenantId,
+          owner: ownerId,
+          property: propertyId,
+          amount: booking.amountPaid,
+          stripeSessionId: session.id,
+        });
+      }
+
+      return res.json({ success: true, booking });
+    }
+
+    res.json({ success: false, message: 'Payment not completed', paymentStatus: session.payment_status });
+  } catch (err) {
+    next(err);
+  }
+};
+
 // @desc    Stripe webhook — finalizes booking/payment status on successful payment
 // @route   POST /api/payments/webhook
-// NOTE: This route must receive the RAW request body (see server.js for the
-// express.raw() middleware applied specifically to this path before json parsing).
+// NOTE: This route must receive the RAW request body (see server.js)
 exports.handleWebhook = async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -84,14 +137,17 @@ exports.handleWebhook = async (req, res) => {
         booking.transactionId = session.payment_intent || session.id;
         await booking.save();
 
-        await Transaction.create({
-          booking: booking._id,
-          tenant: tenantId,
-          owner: ownerId,
-          property: propertyId,
-          amount: booking.amountPaid,
-          stripeSessionId: session.id,
-        });
+        const existingTx = await Transaction.findOne({ stripeSessionId: session.id });
+        if (!existingTx) {
+          await Transaction.create({
+            booking: booking._id,
+            tenant: tenantId,
+            owner: ownerId,
+            property: propertyId,
+            amount: booking.amountPaid,
+            stripeSessionId: session.id,
+          });
+        }
       }
     } catch (err) {
       console.error('Error finalizing booking after payment:', err.message);
